@@ -1,3 +1,9 @@
+---
+layout: post
+title:  Stremio Remote Streaming: When the Port Is Open but the Video Won't Play
+categories: blog
+---
+
 # Stremio Remote Streaming: When the Port Is Open but the Video Won't Play
 
 On iOS, the Stremio PWA can connect to a home media server without a native app. Following the official guide, streaming worked on the server itself, but my phone couldn't reach the streaming server. This guide summarizes the troubleshooting (with help from the Big Pickle model) and the fix.
