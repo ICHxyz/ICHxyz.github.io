@@ -1,0 +1,201 @@
+# Stremio Remote Streaming: When the Port Is Open but the Video Won't Play
+
+On iOS, the Stremio PWA can connect to a home media server without a native app. Following the official guide, streaming worked on the server itself, but my phone couldn't reach the streaming server. This guide summarizes the troubleshooting (with help from the Big Pickle model) and the fix.
+
+## TL;DR
+
+1. **Port open + server status Error = mixed content**, not a firewall issue. The HTTPS web app won't call your plain-HTTP LAN server.
+2. **Enable "remote HTTPS connections"** in Settings → Streaming, pick your LAN IP, and copy the **Streaming HTTPS endpoint**.
+3. **Use that HTTPS URL** as the streaming server on the other machine.
+4. **Whitelist `stremio.rocks` in DNS rebind protection** (or add a hosts entry) — the name resolves to a private IP and many resolvers block that on purpose.
+
+
+## The setup
+
+I run the **Stremio Service** flatpak (`com.stremio.Service`) headless on a Linux box that acts as my always-on streaming server. It listens on the default ports:
+
+- `11470/tcp` — HTTP API + streaming
+- `12470/tcp` — HTTPS API + streaming
+
+On the server itself everything worked: I could open `http://127.0.0.1:11470/`, land in Stremio Web, and play torrents. On a second machine on the same LAN, I could open `http://192.168.1.100:11470/`, get redirected to the Stremio web app, and browse my library — but the **Server status showed "Error"**, and any attempt to actually play a stream failed.
+
+The obvious suspects — bind address, firewall, service crash — were all wrong. The server was fine. The problem was in the browser and the DNS.
+
+## Step 1: Prove the server is actually reachable
+
+First, confirm the service is listening on all interfaces, not just loopback:
+
+```console
+$ ss -ltnp | grep -E '11470|12470'
+LISTEN 0 511  *:11470  *:*  users:(("stremio-runtime",pid=452390,fd=18))
+LISTEN 0 511  *:12470  *:*  users:(("stremio-runtime",pid=452390,fd=19))
+```
+
+`*:11470` means it's bound to `0.0.0.0`/`::` — every interface. And the API answers:
+
+```console
+$ curl -s http://192.168.1.100:11470/settings | head -c 120
+{"options":[{"id":"localAddonEnabled",...
+```
+
+So the port is open, the server is up, and the other machine can reach it. This is **not** a bind or firewall problem for `11470`.
+
+## Step 2: Follow the redirect
+
+Here's what the server returns when you hit its root:
+
+```console
+$ curl -I http://192.168.1.100:11470/
+HTTP/1.1 307 Temporary Redirect
+location: https://app.strem.io/shell-v4.4/?streamingServer=http%3A%2F%2F192.168.1.100%3A11470
+```
+
+The service intentionally redirects you to the hosted web app and passes the streaming server URL as a query parameter. Decoded, that's:
+
+```
+https://app.strem.io/shell-v4.4/?streamingServer=http://192.168.1.100:11470
+```
+
+So the page loads over **HTTPS**, and the app then tries to `fetch()` your streaming server over **plain HTTP**:
+
+```
+https://app.strem.io  ──fetch──▶  http://192.168.1.100:11470/settings
+```
+
+That's the bug. Browsers block an HTTPS page from making active requests to an HTTP origin — **mixed content**. Chrome also layers **Private Network Access** on top, which restricts public origins from reaching private-network addresses. Either way, the request never leaves the browser.
+
+And that's exactly why it "works locally":
+
+```
+https://app.strem.io  ──fetch──▶  http://127.0.0.1:11470/settings   ✅ allowed
+```
+
+Loopback (`127.0.0.1`, `localhost`) is treated as a **potentially trustworthy / secure** origin, so it's exempt from the mixed-content block. A LAN IP like `192.168.1.100` is not. Same server, same code — different security context.
+
+The web app's "Server status" is simply the result of that first `GET /settings`. If the fetch is blocked, the status is **Error**, even though the server is perfectly healthy.
+
+## Step 3: What "Enable remote HTTPS connections" really does
+
+Stremio's answer to this is the built-in HTTPS endpoint on port `12470`. The setting is easy to miss: in **Settings → Streaming**, there's a dropdown labeled **Enable remote HTTPS connections** (`remoteHttps`). Select your LAN IP, and the service provisions a real, browser-trusted certificate.
+
+Under the hood, the web app calls:
+
+```
+GET /get-https?ipAddress=<LAN-IP>&authKey=<your-session-key>
+```
+
+The service then requests a certificate from Stremio's API and builds a hostname from the IP:
+
+```js
+domain: ipAddress.replace(/\./g, "-") + certResp.commonName.replace("*", "")
+```
+
+For `192.168.1.100` that becomes something like:
+
+```
+192-168-1-100.<hash>.stremio.rocks
+```
+
+The certificate is a Let's Encrypt wildcard (`*.<hash>.stremio.rocks`), and Stremio's public DNS zone publishes a per-IP `A` record so the dashed hostname resolves back to that exact LAN IP. The result is a **green-padlock HTTPS endpoint for a local device**:
+
+```
+https://192-168-1-100.<hash>.stremio.rocks:12470/
+```
+
+You can verify it yourself:
+
+```console
+$ curl -sS --resolve 192-168-1-100.<hash>.stremio.rocks:12470:192.168.1.100 \
+    https://192-168-1-100.<hash>.stremio.rocks:12470/settings -o /dev/null -w '%{http_code}\n'
+200
+```
+
+The certificate validates, and the API returns `Access-Control-Allow-Origin: *`, so the hosted web app is allowed to call it.
+
+## Step 4: Point the second machine at the HTTPS endpoint
+
+On the other machine, open Stremio Web and override the streaming server:
+
+1. **Settings → Streaming**
+2. Click the gear/cog next to **Streaming server URL** (or enable **Override streaming server URL (advanced)**)
+3. Enter:
+   ```
+   https://192-168-1-100.<hash>.stremio.rocks:12470/
+   ```
+4. Reload.
+
+Or skip the UI and open the fully-formed link directly:
+
+```
+https://app.strem.io/shell-v4.4/?streamingServer=https%3A%2F%2F192-168-1-100.<hash>.stremio.rocks%3A12470
+```
+
+Server status flips to **Online**, and playback works — no more mixed content, because now both sides are HTTPS.
+
+## Step 5: The second gotcha — DNS rebind protection
+
+This is where I got stuck again. The HTTPS endpoint worked with `curl --resolve`, but the browser on the second machine still couldn't reach it.
+
+The reason: the hostname resolves to a **private IP**, and many routers/firewalls enable **DNS rebinding protection** (dnsmasq's `stop-dns-rebind`, Pi-hole/AdGuard "block private IP answers", etc.). These filters deliberately drop public DNS answers that point at RFC1918 addresses. My router's resolver returned an empty answer with `EDE: 15 (Blocked)`:
+
+```console
+$ dig @192.168.1.1 192-168-1-100.<hash>.stremio.rocks A
+;; status: NOERROR, ANSWER: 0
+; EDE: 15 (Blocked)
+```
+
+Meanwhile a public DoH resolver happily returns the private IP:
+
+```console
+$ curl -s -H 'accept: application/dns-json' \
+    'https://cloudflare-dns.com/dns-query?name=192-168-1-100.<hash>.stremio.rocks&type=A'
+{"Answer":[{"data":"192.168.1.100"}]}
+```
+
+So the record exists and propagates fine — your **local** resolver is just refusing to hand it back. (Stremio maintainers note new `stremio.rocks` subdomains can take a while to propagate, but here the block was local.)
+
+Fix it at the router if you can. On dnsmasq (OpenWrt, Pi-hole, etc.):
+
+```conf
+# allow rebinding for Stremio's zone
+rebind-domain-ok=/stremio.rocks/
+
+# ...or just pin the name locally
+address=/192-168-1-100.<hash>.stremio.rocks/192.168.1.100
+```
+
+On OpenWrt's UCI config, that's a `rebind_domain` entry (or an `address`/domain entry) under `config dnsmasq`. Restart dnsmasq afterwards.
+
+If you can't touch the router, add a hosts entry on the client machine instead:
+
+```
+192.168.1.100  192-168-1-100.<hash>.stremio.rocks
+```
+
+- Linux/macOS: `/etc/hosts`
+- Windows: `C:\Windows\System32\drivers\etc\hosts`
+
+Then flush DNS and confirm:
+
+```console
+$ nslookup 192-168-1-100.<hash>.stremio.rocks
+Address: 192.168.1.100
+```
+
+## A security note
+
+The Stremio streaming server's API is **unauthenticated** — anything that can reach `11470`/`12470` is fully trusted. Keep both ports on your LAN and never port-forward them to the internet. The HTTPS endpoint is for LAN use only; Stremio explicitly does not support exposing the server publicly.
+
+
+---
+
+## References
+
+- rivulet-engine, `docs/HTTPS.md` — best prose explanation of the `*.stremio.rocks` + `/get-https` scheme: <https://github.com/rivulet-kodi/rivulet-engine/blob/v0.18.0/docs/HTTPS.md>
+- Stremio/stremio-service #37 — "Streaming server not available", `/get-https`, DNS propagation: <https://github.com/Stremio/stremio-service/issues/37>
+- Stremio/stremio-service #39 — LAN access requires HTTPS: <https://github.com/Stremio/stremio-service/issues/39>
+- Stremio/stremio-shell #242 — "Enable Remote HTTPS Connections" / "Streaming HTTPS Endpoint" steps: <https://github.com/Stremio/stremio-shell/issues/242>
+- Stremio/server-docker #8 — server-generated certs and ports 11470/12470: <https://github.com/Stremio/server-docker/issues/8>
+- Stremio/stremio-web #241 — "Enable remote https connections" creates the correct link: <https://github.com/Stremio/stremio-web/issues/241>
+- M0Rf30/stremio-server-go — Go reimplementation documenting the same HTTPS flow: <https://github.com/M0Rf30/stremio-server-go>
+- HowToMediaCenter, "Complete Stremio Guide 2026" — end-user UI walkthrough: <https://howtomediacenter.com/en/stremio-guide>
